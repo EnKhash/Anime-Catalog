@@ -1,0 +1,16 @@
+{
+  "name": "mabel-anime-catalog",
+  "version": "1.0.0",
+  "description": "Custom anime catalog addon for Nuvio/Stremio, powered by Kitsu",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  }
+}
