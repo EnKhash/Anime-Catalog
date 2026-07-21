@@ -1,0 +1,222 @@
+const express = require("express");
+const cors = require("cors");
+
+const app = express();
+app.use(cors());
+
+const KITSU_BASE = "https://kitsu.io/api/edge";
+const PAGE_SIZE = 24;
+
+// ---- simple in-memory cache (1 hour TTL) ----
+const cache = new Map();
+const TTL_MS = 60 * 60 * 1000;
+
+async function cachedFetch(key, url, retries = 1) {
+  const hit = cache.get(key);
+  if (hit && Date.now() - hit.time < TTL_MS) return hit.data;
+
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, {
+        headers: { Accept: "application/vnd.api+json" },
+      });
+      if (!res.ok) throw new Error(`Kitsu API ${res.status} for ${url}`);
+      const data = await res.json();
+      cache.set(key, { data, time: Date.now() });
+      return data;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  throw lastErr;
+}
+
+// ---- catalog definitions ----
+// each builds a Kitsu API URL given { skip, search }
+const CATALOGS = {
+  "kitsu-trending": {
+    name: "Trending Anime",
+    type: "series",
+    build: () => `${KITSU_BASE}/trending/anime`,
+    pageable: false,
+  },
+  "kitsu-popular": {
+    name: "Popular Anime",
+    type: "series",
+    build: ({ skip }) =>
+      `${KITSU_BASE}/anime?sort=-userCount&page[limit]=${PAGE_SIZE}&page[offset]=${skip}`,
+    pageable: true,
+  },
+  "kitsu-top-rated": {
+    name: "Top Rated Anime",
+    type: "series",
+    build: ({ skip }) =>
+      `${KITSU_BASE}/anime?sort=-averageRating&page[limit]=${PAGE_SIZE}&page[offset]=${skip}`,
+    pageable: true,
+  },
+  "kitsu-airing": {
+    name: "Airing Now",
+    type: "series",
+    build: ({ skip }) =>
+      `${KITSU_BASE}/anime?filter[status]=current&sort=-userCount&page[limit]=${PAGE_SIZE}&page[offset]=${skip}`,
+    pageable: true,
+  },
+  "kitsu-movies": {
+    name: "Anime Movies",
+    type: "movie",
+    build: ({ skip }) =>
+      `${KITSU_BASE}/anime?filter[subtype]=movie&sort=-userCount&page[limit]=${PAGE_SIZE}&page[offset]=${skip}`,
+    pageable: true,
+  },
+};
+
+// ---- search (shared across catalogs when a search term is present) ----
+function searchUrl({ text, skip }) {
+  return `${KITSU_BASE}/anime?filter[text]=${encodeURIComponent(
+    text
+  )}&page[limit]=${PAGE_SIZE}&page[offset]=${skip}`;
+}
+
+// ---- map a Kitsu anime object -> Stremio/Nuvio meta object ----
+function toMeta(item) {
+  const a = item.attributes || {};
+  const isMovie = a.subtype === "movie";
+  const poster = a.posterImage?.large || a.posterImage?.original || a.posterImage?.medium;
+  const background = a.coverImage?.large || a.coverImage?.original;
+
+  return {
+    id: `kitsu:${item.id}`,
+    type: isMovie ? "movie" : "series",
+    name: a.canonicalTitle || a.titles?.en || a.titles?.en_jp || "Unknown",
+    poster,
+    posterShape: "poster",
+    background,
+    description: a.synopsis,
+    releaseInfo: a.startDate ? a.startDate.slice(0, 4) : undefined,
+    imdbRating: a.averageRating ? (a.averageRating / 10).toFixed(1) : undefined,
+    runtime: a.episodeLength ? `${a.episodeLength} min` : undefined,
+  };
+}
+
+// ---- manifest ----
+const manifest = {
+  id: "com.mabel.animecatalog",
+  version: "1.0.0",
+  name: "Mabel's Anime Library",
+  description:
+    "Full anime catalog (Trending, Popular, Top Rated, Airing, Movies) powered by Kitsu — outputs kitsu: IDs for compatibility with AIOStreams.",
+  logo: "https://kitsu.io/kitsu-256.png",
+  resources: ["catalog", "meta"],
+  types: ["series", "movie"],
+  idPrefixes: ["kitsu"],
+  catalogs: Object.entries(CATALOGS).map(([id, c]) => ({
+    type: c.type,
+    id,
+    name: c.name,
+    extra: [
+      { name: "skip", isRequired: false },
+      { name: "search", isRequired: false },
+    ],
+  })),
+  behaviorHints: { configurable: false, configurationRequired: false },
+};
+
+app.get("/manifest.json", (req, res) => {
+  res.setHeader("Cache-Control", "max-age=86400");
+  res.json(manifest);
+});
+
+// ---- catalog handler ----
+// Stremio/Nuvio requests: /catalog/:type/:id.json  or  /catalog/:type/:id/:extra.json
+app.get("/catalog/:type/:id/:extra?.json", async (req, res) => {
+  try {
+    const { type, id, extra } = req.params;
+    const def = CATALOGS[id];
+    if (!def || def.type !== type) return res.json({ metas: [] });
+
+    // parse extra segment: e.g. "skip=24" or "search=frieren&skip=0"
+    let skip = 0;
+    let search = null;
+    if (extra) {
+      const params = new URLSearchParams(extra.replace(/&/g, "&"));
+      if (params.get("skip")) skip = parseInt(params.get("skip"), 10) || 0;
+      if (params.get("search")) search = params.get("search");
+    }
+
+    const cacheKey = `${id}:${skip}:${search || ""}`;
+    const url = search ? searchUrl({ text: search, skip }) : def.build({ skip });
+
+    const json = await cachedFetch(cacheKey, url);
+    const metas = (json.data || [])
+      .map(toMeta)
+      .filter((m) => (search ? true : m.type === type)); // trending/search may mix types
+
+    res.setHeader("Cache-Control", "max-age=3600");
+    res.json({ metas });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ metas: [], error: String(err) });
+  }
+});
+
+app.get("/", (req, res) => {
+  res.send("Mabel's Anime Library — add /manifest.json to Nuvio.");
+});
+
+// ---- meta handler ----
+// This is what makes posters clickable: Nuvio calls this to get full
+// details + episode list before it can open the title.
+app.get("/meta/:type/:id.json", async (req, res) => {
+  try {
+    const { type, id } = req.params; // id like "kitsu:7442"
+    const kitsuId = id.replace(/^kitsu:/, "");
+
+    const animeData = await cachedFetch(
+      `meta:${kitsuId}`,
+      `${KITSU_BASE}/anime/${kitsuId}`
+    );
+    const item = animeData.data;
+    if (!item) return res.status(404).json({ meta: null });
+
+    const meta = toMeta(item);
+    meta.id = id; // preserve exact id Nuvio asked for
+
+    if (type === "series") {
+      const epData = await cachedFetch(
+        `episodes:${kitsuId}`,
+        `${KITSU_BASE}/anime/${kitsuId}/episodes?page[limit]=200&sort=number`
+      );
+      meta.videos = (epData.data || [])
+        .map((ep) => {
+          const ea = ep.attributes || {};
+          if (ea.number == null) return null;
+          return {
+            id: `kitsu:${kitsuId}:${ea.number}`,
+            title: ea.canonicalTitle || `Episode ${ea.number}`,
+            season: 1,
+            episode: ea.number,
+            released: ea.airdate
+              ? new Date(ea.airdate).toISOString()
+              : undefined,
+            thumbnail: ea.thumbnail?.original,
+          };
+        })
+        .filter(Boolean);
+    }
+
+    res.setHeader("Cache-Control", "max-age=3600");
+    res.json({ meta });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ meta: null, error: String(err) });
+  }
+});
+
+const PORT = process.env.PORT || 7050;
+if (require.main === module) {
+  app.listen(PORT, () => console.log(`Anime catalog addon running on :${PORT}`));
+}
+
+module.exports = app;
